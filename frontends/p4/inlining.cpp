@@ -776,14 +776,14 @@ const IR::Node* GeneralInliner::preorder(IR::ParserState* state) {
     auto srcInfo = state->srcInfo;
     auto annotations = state->annotations;
     IR::ID name = state->name;
-    for (auto e : state->components) {
-        if (!e->is<IR::MethodCallStatement>()) {
-            current.push_back(e);
+    for (auto e = state->components.begin(); e != state->components.end(); ++e) {
+        if (!(*e)->is<IR::MethodCallStatement>()) {
+            current.push_back(*e);
             continue;
         }
-        auto call = e->to<IR::MethodCallStatement>();
+        auto call = (*e)->to<IR::MethodCallStatement>();
         if (workToDo->callToInstance.find(call) == workToDo->callToInstance.end()) {
-            current.push_back(e);
+            current.push_back(*e);
             continue;
         }
 
@@ -827,6 +827,23 @@ const IR::Node* GeneralInliner::preorder(IR::ParserState* state) {
             }
         }
 
+        // Get list of components following the current one
+        auto remainingComponents = new IR::IndexedVector<IR::StatOrDecl>();
+        remainingComponents->insert(remainingComponents->end(), e + 1, state->components.end());
+
+        auto reusedStartStateName = workToDo->getStartStateName(decl, state->selectExpression,
+                remainingComponents);
+        if (reusedStartStateName != nullptr) {
+            auto newState = new IR::ParserState(srcInfo, name, annotations, current,
+                    new IR::PathExpression(*reusedStartStateName));
+            states->push_back(newState);
+            LOG3("Reusing inlined state: " << *reusedStartStateName << " in new state: " <<
+                    dbp(newState) << std::endl <<
+                    "Replacing " << dbp(state) << " with " << states->size() << " states");
+            prune();
+            return states;
+        }
+
         callee = substs->rename<IR::P4Parser>(refMap, callee);
 
         cstring nextState = refMap->newName(state->name);
@@ -835,9 +852,11 @@ const IR::Node* GeneralInliner::preorder(IR::ParserState* state) {
         (void)callee->apply(cnn);
         RenameStates rs(&renameMap);
         auto renamed = callee->apply(rs);
-        cstring newStartName = ::get(renameMap, IR::ParserState::start);
-        auto transition = new IR::PathExpression(IR::ID(newStartName, nullptr));
-        auto newState = new IR::ParserState(srcInfo, name, annotations, current, transition);
+        IR::ID newStartName(::get(renameMap, IR::ParserState::start), IR::ParserState::start);
+        workToDo->addInlinedInvocation(decl, state->selectExpression,
+                remainingComponents, newStartName);
+        auto newState = new IR::ParserState(srcInfo, name, annotations, current,
+                new IR::PathExpression(newStartName));
         states->push_back(newState);
         for (auto s : renamed->to<IR::P4Parser>()->states) {
             if (s->name == IR::ParserState::accept ||
@@ -848,7 +867,7 @@ const IR::Node* GeneralInliner::preorder(IR::ParserState* state) {
 
         // Prepare next state
         annotations = IR::Annotations::empty;
-        name = IR::ID(nextState, nullptr);
+        name = IR::ID(nextState, state->name);
         current.clear();
 
         // Copy back out and inout parameters

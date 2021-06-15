@@ -100,10 +100,52 @@ struct PerInstanceSubstitutions {
 struct InlineSummary : public IHasDbPrint {
     /// Various substitutions that must be applied for each instance
     struct PerCaller {  // information for each caller
+        /// 3-tuple identifying all the invocations of the subparser which can use the same
+        /// inlined states.
+        /// Consists of:
+        /// - Pointer to the declaration of the invoked subparser
+        /// - Pointer to the expression representing the transition statement from the state
+        ///   which invokes the subparser
+        /// - Pointer to a newly constructed IndexedVector of all parser statements
+        ///   which follow the subparser invocation (not including the transition statement)
+        typedef std::tuple<const IR::Declaration_Instance *,
+                           const IR::Expression *,
+                           const IR::IndexedVector<IR::StatOrDecl> *> InlinedInvocationInfo;
+
+        /// Hash for InlinedInvocationInfo used as a key for unordered_map
+        struct key_hash {
+            std::size_t operator() (const InlinedInvocationInfo &k) const {
+                std::ostringstream oss;
+                std::get<1>(k)->dbprint(oss);
+                for (auto e : *std::get<2>(k)) {
+                    e->dbprint(oss);
+                }
+                return std::hash<const IR::Declaration_Instance *>{}(std::get<0>(k)) ^
+                        std::hash<std::string>{}(oss.str());
+            }
+        };
+
+        /// Binary equality predicate for InlinedInvocationInfo used as a key for unordered_map
+        struct key_equal {
+            bool operator() (const InlinedInvocationInfo &v0,
+                    const InlinedInvocationInfo &v1) const {
+                return std::get<0>(v0) == std::get<0>(v1) &&
+                        std::get<1>(v0)->equiv(*std::get<1>(v1)) &&
+                        std::get<2>(v0)->equiv(*std::get<2>(v1));
+            }
+        };
+
         /// For each instance (key) the container that is intantiated.
         std::map<const IR::Declaration_Instance*, const IR::IContainer*> declToCallee;
         /// For each instance (key) we must apply a bunch of substitutions
         std::map<const IR::Declaration_Instance*, PerInstanceSubstitutions*> substitutions;
+        /// For each distinct invocation of the subparser identified by InlinedInvocationInfo
+        /// we store the name of the next caller parser state which is a new state replacing
+        /// the start state of the callee parser (subparser).
+        /// Transition to this state is used in case there is another subparser invocation
+        /// which has the equivalent InlinedInvocationInfo.
+        std::unordered_map<const InlinedInvocationInfo, const IR::ID, key_hash, key_equal>
+                invocationToState;
         /// For each invocation (key) call the instance that is invoked.
         std::map<const IR::MethodCallStatement*, const IR::Declaration_Instance*> callToInstance;
         /// @returns nullptr if there isn't exactly one caller,
@@ -120,6 +162,36 @@ struct InlineSummary : public IHasDbPrint {
                 }
             }
             return call;
+        }
+
+        /// Stores the information needed to identify the invocations of subparser
+        /// which require distinct inlined states and the name of the new caller parser
+        /// state which replaces the callee parser (subparser) start state.
+        void addInlinedInvocation(const IR::Declaration_Instance* decl,
+                const IR::Expression *selectExpression,
+                const IR::IndexedVector<IR::StatOrDecl> *remainingComponents,
+                const IR::ID startStateName) {
+            auto ret = invocationToState.emplace(
+                    std::make_tuple(decl, selectExpression, remainingComponents),
+                    startStateName);
+            BUG_CHECK(ret.second == true || startStateName == ret.first->second,
+                    "State: %1% already saved, can not save: %2%!",
+                    ret.first->second, startStateName);
+        }
+
+        /// Returns pointer to the name of the caller parser state which is
+        /// a start state of the inlined callee parser (subparser).
+        /// If the callee parser (subparser) is not inlined for a given
+        /// invocation yet, nullptr is returned.
+        const IR::ID* getStartStateName(const IR::Declaration_Instance* decl,
+                const IR::Expression *selectExpression,
+                const IR::IndexedVector<IR::StatOrDecl> *remainingComponents) {
+            auto invocationToStateRecord = invocationToState.find(
+                std::make_tuple(decl, selectExpression, remainingComponents));
+            if (invocationToStateRecord != invocationToState.end())
+                return &invocationToStateRecord->second;
+            else
+                return nullptr;
         }
     };
     std::map<const IR::IContainer*, PerCaller> callerToWork;
